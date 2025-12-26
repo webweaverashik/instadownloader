@@ -1,790 +1,586 @@
 <?php
-
 namespace App\Services;
 
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
 use Exception;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class InstagramScraperService
 {
     protected string $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-    
-    protected array $defaultHeaders = [];
-
-    public function __construct()
-    {
-        // Note: Removed 'br' (Brotli) encoding as it's not supported by all cURL installations
-        $this->defaultHeaders = [
-            'User-Agent' => $this->userAgent,
-            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language' => 'en-US,en;q=0.9',
-            'Accept-Encoding' => 'gzip, deflate', // Removed 'br' to fix Laragon cURL issue
-            'Connection' => 'keep-alive',
-            'Upgrade-Insecure-Requests' => '1',
-            'Sec-Fetch-Dest' => 'document',
-            'Sec-Fetch-Mode' => 'navigate',
-            'Sec-Fetch-Site' => 'none',
-            'Sec-Fetch-User' => '?1',
-            'Cache-Control' => 'max-age=0',
-        ];
-    }
-
-    /**
-     * Get HTTP client with proper configuration for Laragon/Windows
-     */
-    protected function getHttpClient()
-    {
-        return Http::withHeaders($this->defaultHeaders)
-            ->withOptions([
-                'verify' => false, // Disable SSL verification for local development
-                'timeout' => 30,
-                'connect_timeout' => 10,
-                'decode_content' => true, // Let Guzzle handle decoding
-            ]);
-    }
 
     /**
      * Analyze Instagram URL and extract content information
      */
     public function analyzeUrl(string $url): array
     {
-        // Clean the URL - remove tracking parameters
-        $url = $this->cleanInstagramUrl($url);
-        
+        $url       = $this->cleanInstagramUrl($url);
         $shortcode = $this->extractShortcode($url);
-        
+
         if (empty($shortcode)) {
             throw new Exception('Invalid Instagram URL. Could not extract shortcode.');
         }
 
-        $cacheKey = 'instagram_' . md5($shortcode);
-        
-        // Try cache first (cache for 30 minutes)
+        $cacheKey = 'instagram_v3_' . md5($shortcode);
+
+        // Clear cache for testing - remove in production
+        // Cache::forget($cacheKey);
+
         if (Cache::has($cacheKey)) {
             return Cache::get($cacheKey);
         }
 
-        // Try multiple methods to fetch data
-        $data = null;
+        $data   = null;
         $errors = [];
 
-        // Method 1: Try GraphQL API
+        // Method 1: Try the direct API endpoint (best for getting video URLs)
         try {
-            $data = $this->fetchViaGraphQL($shortcode);
-        } catch (Exception $e) {
-            $errors[] = 'GraphQL: ' . $e->getMessage();
-            Log::debug('GraphQL fetch failed: ' . $e->getMessage());
-        }
-        
-        // Method 2: Try oEmbed
-        if (!$data) {
-            try {
-                $data = $this->fetchViaOEmbed($url);
-            } catch (Exception $e) {
-                $errors[] = 'oEmbed: ' . $e->getMessage();
-                Log::debug('oEmbed fetch failed: ' . $e->getMessage());
+            $data = $this->fetchViaDirectApi($shortcode);
+            if ($data && ! empty($data['media'])) {
+                Log::info('Fetched via Direct API', ['shortcode' => $shortcode]);
             }
+        } catch (Exception $e) {
+            $errors[] = 'DirectAPI: ' . $e->getMessage();
+            Log::debug('Direct API failed: ' . $e->getMessage());
+            $data = null;
         }
-        
-        // Method 3: Try embed page scraping
-        if (!$data) {
+
+        // Method 2: Try embed page with better video extraction
+        if (! $data || empty($data['media'][0]['video_url'])) {
             try {
-                $data = $this->fetchViaEmbedPage($shortcode);
+                $embedData = $this->fetchViaEmbed($shortcode);
+                if ($embedData) {
+                    // Merge video URL if we got it
+                    if ($data && ! empty($embedData['video_url'])) {
+                        $data['media'][0]['video_url'] = $embedData['video_url'];
+                    } elseif ($embedData) {
+                        $data = $embedData;
+                    }
+                    Log::info('Fetched via Embed', ['shortcode' => $shortcode]);
+                }
             } catch (Exception $e) {
                 $errors[] = 'Embed: ' . $e->getMessage();
-                Log::debug('Embed page fetch failed: ' . $e->getMessage());
+                Log::debug('Embed failed: ' . $e->getMessage());
             }
         }
 
-        // Method 4: Try direct page with JSON
-        if (!$data) {
+        // Method 3: Try scraping the main page for video URL
+        if (! $data || ($data['is_video'] && empty($data['media'][0]['video_url']))) {
             try {
-                $data = $this->fetchViaDirectApi($shortcode);
+                $pageData = $this->fetchViaPageScrape($url, $shortcode);
+                if ($pageData) {
+                    if ($data && ! empty($pageData['video_url'])) {
+                        $data['media'][0]['video_url'] = $pageData['video_url'];
+                    } elseif (! $data) {
+                        $data = $pageData;
+                    }
+                    Log::info('Fetched via Page Scrape', ['shortcode' => $shortcode]);
+                }
             } catch (Exception $e) {
-                $errors[] = 'Direct: ' . $e->getMessage();
-                Log::debug('Direct API fetch failed: ' . $e->getMessage());
+                $errors[] = 'PageScrape: ' . $e->getMessage();
+                Log::debug('Page scrape failed: ' . $e->getMessage());
             }
         }
 
-        // Method 5: Try web page scraping
-        if (!$data) {
-            try {
-                $data = $this->fetchViaWebPage($url, $shortcode);
-            } catch (Exception $e) {
-                $errors[] = 'WebPage: ' . $e->getMessage();
-                Log::debug('Web page fetch failed: ' . $e->getMessage());
-            }
-        }
-
-        if (!$data) {
+        if (! $data) {
             Log::error('All Instagram fetch methods failed', ['errors' => $errors, 'url' => $url]);
-            throw new Exception('Unable to fetch Instagram content. The post may be private or deleted. Errors: ' . implode('; ', $errors));
+            throw new Exception('Unable to fetch Instagram content. The post may be private or deleted.');
         }
 
-        // Cache the result
-        Cache::put($cacheKey, $data, 1800); // 30 minutes
+        // Log what we got for debugging
+        Log::info('Final data', [
+            'shortcode'         => $shortcode,
+            'is_video'          => $data['is_video'] ?? false,
+            'has_video_url'     => ! empty($data['media'][0]['video_url'] ?? null),
+            'video_url_preview' => substr($data['media'][0]['video_url'] ?? 'none', 0, 100),
+        ]);
+
+        // Cache for 30 minutes
+        Cache::put($cacheKey, $data, 1800);
 
         return $data;
     }
 
     /**
-     * Clean Instagram URL - remove tracking parameters
-     */
-    protected function cleanInstagramUrl(string $url): string
-    {
-        // Parse URL and remove query parameters
-        $parsed = parse_url($url);
-        $cleanUrl = ($parsed['scheme'] ?? 'https') . '://' . ($parsed['host'] ?? 'www.instagram.com') . ($parsed['path'] ?? '');
-        
-        // Remove trailing slash
-        return rtrim($cleanUrl, '/');
-    }
-
-    /**
-     * Fetch data via Instagram GraphQL API
-     */
-    protected function fetchViaGraphQL(string $shortcode): ?array
-    {
-        $variables = json_encode([
-            'shortcode' => $shortcode,
-            'child_comment_count' => 0,
-            'fetch_comment_count' => 0,
-            'parent_comment_count' => 0,
-            'has_threaded_comments' => false,
-        ]);
-
-        $url = 'https://www.instagram.com/graphql/query/?' . http_build_query([
-            'query_hash' => 'b3055c01b4b222b8a47dc12b090e4e64',
-            'variables' => $variables,
-        ]);
-
-        $response = $this->getHttpClient()->get($url);
-
-        if ($response->successful()) {
-            $json = $response->json();
-            if (isset($json['data']['shortcode_media'])) {
-                return $this->parseGraphQLResponse($json['data']['shortcode_media']);
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Fetch data via oEmbed API
-     */
-    protected function fetchViaOEmbed(string $url): ?array
-    {
-        $oembedUrl = 'https://api.instagram.com/oembed/?' . http_build_query([
-            'url' => $url,
-            'omitscript' => 'true',
-        ]);
-
-        $response = $this->getHttpClient()->get($oembedUrl);
-
-        if ($response->successful()) {
-            $data = $response->json();
-            if ($data && isset($data['thumbnail_url'])) {
-                return $this->parseOEmbedResponse($data, $url);
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Fetch via embed page
-     */
-    protected function fetchViaEmbedPage(string $shortcode): ?array
-    {
-        $embedUrl = "https://www.instagram.com/p/{$shortcode}/embed/captioned/";
-        
-        $response = $this->getHttpClient()->get($embedUrl);
-
-        if ($response->successful()) {
-            $html = $response->body();
-            $data = $this->parseEmbedPage($html, $shortcode);
-            if ($data) {
-                return $data;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Fetch via direct API endpoint
+     * Fetch via Instagram's direct API endpoint
      */
     protected function fetchViaDirectApi(string $shortcode): ?array
     {
-        $directUrl = "https://www.instagram.com/p/{$shortcode}/?__a=1&__d=dis";
-        
-        $response = $this->getHttpClient()
-            ->withHeaders([
-                'X-IG-App-ID' => '936619743392459',
+        // Use the Instagram API endpoint
+        $url = "https://www.instagram.com/api/v1/media/{$shortcode}/info/";
+
+        $response = $this->makeRequest($url, [
+            'X-IG-App-ID'      => '936619743392459',
+            'X-ASBD-ID'        => '129477',
+            'X-IG-WWW-Claim'   => '0',
+            'X-Requested-With' => 'XMLHttpRequest',
+        ]);
+
+        if (! $response) {
+            // Try alternate endpoint
+            $url      = "https://www.instagram.com/p/{$shortcode}/?__a=1&__d=dis";
+            $response = $this->makeRequest($url, [
+                'X-IG-App-ID'      => '936619743392459',
                 'X-Requested-With' => 'XMLHttpRequest',
-            ])
-            ->get($directUrl);
+            ]);
+        }
 
-        if ($response->successful()) {
-            $json = $response->json();
-            if (isset($json['items'][0])) {
-                return $this->parseDirectResponse($json['items'][0]);
-            }
-            if (isset($json['graphql']['shortcode_media'])) {
-                return $this->parseGraphQLResponse($json['graphql']['shortcode_media']);
-            }
+        if (! $response) {
+            return null;
+        }
+
+        $json = json_decode($response, true);
+        if (! $json) {
+            return null;
+        }
+
+        // Handle different response formats
+        if (isset($json['items'][0])) {
+            return $this->parseItemsFormat($json['items'][0], $shortcode);
+        }
+
+        if (isset($json['graphql']['shortcode_media'])) {
+            return $this->parseGraphQLFormat($json['graphql']['shortcode_media']);
         }
 
         return null;
     }
 
     /**
-     * Fetch data by scraping the web page
+     * Parse the items format from Instagram API
      */
-    protected function fetchViaWebPage(string $url, string $shortcode): ?array
+    protected function parseItemsFormat(array $item, string $shortcode): array
     {
-        $response = $this->getHttpClient()->get($url);
+        $mediaType   = $item['media_type'] ?? 1;
+        $productType = $item['product_type'] ?? '';
 
-        if ($response->successful()) {
-            $html = $response->body();
-            return $this->parseWebPage($html, $shortcode);
-        }
+        $isVideo    = $mediaType == 2 || isset($item['video_versions']);
+        $isCarousel = $mediaType == 8 || isset($item['carousel_media']);
 
-        return null;
-    }
-
-    /**
-     * Parse GraphQL response
-     */
-    protected function parseGraphQLResponse(array $media): array
-    {
-        $isVideo = $media['is_video'] ?? false;
-        $isCarousel = ($media['__typename'] ?? '') === 'GraphSidecar';
-        
         $contentType = 'photo';
         if ($isVideo) {
-            $contentType = $this->isReels($media) ? 'reels' : 'video';
+            $contentType = ($productType === 'clips' || $productType === 'reels') ? 'reels' : 'video';
+        }
+
+        $user       = $item['user'] ?? [];
+        $username   = $user['username'] ?? 'unknown';
+        $userAvatar = $user['profile_pic_url'] ?? $this->getDefaultAvatar($username);
+
+        $caption = '';
+        if (isset($item['caption']['text'])) {
+            $caption = $item['caption']['text'];
+        }
+
+        $timestamp = $item['taken_at'] ?? time();
+
+        $media = [];
+
+        if ($isCarousel && isset($item['carousel_media'])) {
+            foreach ($item['carousel_media'] as $index => $carouselItem) {
+                $media[] = $this->extractMediaInfo($carouselItem, $index);
+            }
+        } else {
+            $media[] = $this->extractMediaInfo($item, 0);
         }
 
         $result = [
-            'success' => true,
-            'shortcode' => $media['shortcode'],
-            'type' => $contentType,
-            'is_video' => $isVideo,
-            'is_carousel' => $isCarousel,
-            'username' => '@' . ($media['owner']['username'] ?? 'unknown'),
-            'user_id' => $media['owner']['id'] ?? null,
-            'user_avatar' => $media['owner']['profile_pic_url'] ?? $this->getDefaultAvatar(),
-            'user_full_name' => $media['owner']['full_name'] ?? '',
-            'post_date' => isset($media['taken_at_timestamp']) 
-                ? date('F j, Y', $media['taken_at_timestamp']) 
-                : date('F j, Y'),
-            'timestamp' => $media['taken_at_timestamp'] ?? time(),
-            'caption' => $this->extractCaption($media),
-            'likes' => $media['edge_media_preview_like']['count'] ?? 0,
-            'comments' => $media['edge_media_to_comment']['count'] ?? 0,
-            'preview_url' => $media['display_url'] ?? $media['thumbnail_src'] ?? '',
-            'media' => [],
+            'success'        => true,
+            'shortcode'      => $shortcode,
+            'type'           => $contentType,
+            'is_video'       => $isVideo,
+            'is_carousel'    => $isCarousel,
+            'carousel_count' => $isCarousel ? count($media) : 0,
+            'username'       => '@' . $username,
+            'user_full_name' => $user['full_name'] ?? $username,
+            'user_avatar'    => $userAvatar,
+            'post_date'      => date('F j, Y', $timestamp),
+            'timestamp'      => $timestamp,
+            'caption'        => $caption,
+            'likes'          => $item['like_count'] ?? 0,
+            'comments'       => $item['comment_count'] ?? 0,
+            'post_url'       => "https://www.instagram.com/p/{$shortcode}/",
+            'media'       => $media,
+            'preview_url' => $media[0]['preview_url'] ?? '',
+            'duration'    => $media[0]['duration'] ?? null,
+            'resolution'  => $media[0]['resolution'] ?? '1080 × 1080',
         ];
 
-        if ($isCarousel && isset($media['edge_sidecar_to_children']['edges'])) {
-            foreach ($media['edge_sidecar_to_children']['edges'] as $index => $edge) {
-                $child = $edge['node'];
-                $result['media'][] = $this->extractMediaInfo($child, $index);
-            }
-            $result['carousel_count'] = count($result['media']);
-        } else {
-            $result['media'][] = $this->extractMediaInfo($media, 0);
-            $result['carousel_count'] = 0;
-        }
-
-        // Set main media info from first item
-        if (!empty($result['media'])) {
-            $mainMedia = $result['media'][0];
-            $result['duration'] = $mainMedia['duration'] ?? null;
-            $result['resolution'] = $mainMedia['resolution'] ?? '1080 × 1080';
-            $result['download_options'] = $this->generateDownloadOptions($result);
-        }
+        $result['download_options'] = $this->generateDownloadOptions($result);
 
         return $result;
     }
 
     /**
-     * Extract media information from a single media node
+     * Extract media info from an item
      */
-    protected function extractMediaInfo(array $media, int $index): array
+    protected function extractMediaInfo(array $item, int $index): array
     {
-        $isVideo = $media['is_video'] ?? false;
-        
-        $info = [
-            'index' => $index,
-            'type' => $isVideo ? 'video' : 'photo',
-            'preview_url' => $media['display_url'] ?? '',
-            'thumbnail_url' => $media['thumbnail_src'] ?? $media['display_url'] ?? '',
-        ];
+        $mediaType = $item['media_type'] ?? 1;
+        $isVideo   = $mediaType == 2 || isset($item['video_versions']);
 
-        if ($isVideo) {
-            $info['video_url'] = $media['video_url'] ?? null;
-            $info['duration'] = isset($media['video_duration']) 
-                ? $this->formatDuration($media['video_duration']) 
-                : null;
-            $info['views'] = $media['video_view_count'] ?? 0;
-        }
-
-        // Get dimensions
-        $width = $media['dimensions']['width'] ?? 1080;
-        $height = $media['dimensions']['height'] ?? 1080;
-        $info['width'] = $width;
-        $info['height'] = $height;
-        $info['resolution'] = "{$width} × {$height}";
-
-        // Get all available image resources
-        if (isset($media['display_resources'])) {
-            $info['resources'] = array_map(function ($resource) {
-                return [
-                    'src' => $resource['src'],
-                    'width' => $resource['config_width'],
-                    'height' => $resource['config_height'],
-                ];
-            }, $media['display_resources']);
-        }
-
-        return $info;
-    }
-
-    /**
-     * Parse oEmbed response
-     */
-    protected function parseOEmbedResponse(array $data, string $originalUrl): array
-    {
-        $shortcode = $this->extractShortcode($originalUrl);
-        
-        return [
-            'success' => true,
-            'shortcode' => $shortcode,
-            'type' => 'post',
-            'is_video' => false,
-            'is_carousel' => false,
-            'username' => '@' . ($data['author_name'] ?? 'unknown'),
-            'user_avatar' => $this->getDefaultAvatar(),
-            'post_date' => date('F j, Y'),
-            'caption' => strip_tags($data['title'] ?? ''),
-            'preview_url' => $data['thumbnail_url'] ?? '',
-            'thumbnail_url' => $data['thumbnail_url'] ?? '',
-            'media' => [
-                [
-                    'index' => 0,
-                    'type' => 'photo',
-                    'preview_url' => $data['thumbnail_url'] ?? '',
-                    'width' => $data['thumbnail_width'] ?? 1080,
-                    'height' => $data['thumbnail_height'] ?? 1080,
-                    'resolution' => ($data['thumbnail_width'] ?? 1080) . ' × ' . ($data['thumbnail_height'] ?? 1080),
-                ]
-            ],
-            'resolution' => ($data['thumbnail_width'] ?? 1080) . ' × ' . ($data['thumbnail_height'] ?? 1080),
-            'download_options' => $this->generateDownloadOptions(['type' => 'photo']),
-        ];
-    }
-
-    /**
-     * Parse embed page HTML
-     */
-    protected function parseEmbedPage(string $html, string $shortcode): ?array
-    {
-        // Try to extract JSON data from embed page
-        $patterns = [
-            '/window\.__additionalDataLoaded\s*\(\s*[\'"]extra[\'"]\s*,\s*(\{.+?\})\s*\)\s*;/s',
-            '/"shortcode_media"\s*:\s*(\{.+?\})\s*,\s*"[a-z]/s',
-            '/\\\\\"shortcode_media\\\\\":\s*(\{.+?\})/s',
-        ];
-
-        foreach ($patterns as $pattern) {
-            if (preg_match($pattern, $html, $matches)) {
-                $jsonStr = $matches[1];
-                // Unescape if needed
-                $jsonStr = str_replace(['\\\"', '\\\\'], ['"', '\\'], $jsonStr);
-                $json = json_decode($jsonStr, true);
-                if ($json && isset($json['shortcode'])) {
-                    return $this->parseGraphQLResponse($json);
-                }
-            }
-        }
-
-        // Fallback: Extract basic info from HTML
-        $result = [
-            'success' => true,
-            'shortcode' => $shortcode,
-            'type' => 'post',
-            'is_video' => false,
-            'is_carousel' => false,
-            'media' => [],
-            'username' => '@unknown',
-            'user_avatar' => $this->getDefaultAvatar(),
-            'post_date' => date('F j, Y'),
-            'caption' => '',
+        $media = [
+            'index'       => $index,
+            'type'        => $isVideo ? 'video' : 'photo',
             'preview_url' => '',
+            'video_url'   => null,
+            'width'       => 0,
+            'height'      => 0,
+            'resolution'  => '1080 × 1080',
+            'resources'   => [],
         ];
 
-        // Extract image URL
-        $imgPatterns = [
-            '/<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"/i',
-            '/property="og:image"\s+content="([^"]+)"/i',
-            '/srcset="([^"\s,]+)/i',
-            '/<img[^>]+src="(https:\/\/[^"]+instagram[^"]+)"/i',
-        ];
-
-        foreach ($imgPatterns as $pattern) {
-            if (preg_match($pattern, $html, $imgMatch)) {
-                $result['preview_url'] = html_entity_decode($imgMatch[1]);
-                $result['media'][] = [
-                    'index' => 0,
-                    'type' => 'photo',
-                    'preview_url' => $result['preview_url'],
-                    'resolution' => '1080 × 1080',
-                ];
-                break;
-            }
-        }
-
-        // Check for video
-        if (preg_match('/<video[^>]+src="([^"]+)"/i', $html, $videoMatch)) {
-            $result['is_video'] = true;
-            $result['type'] = 'video';
-            if (!empty($result['media'])) {
-                $result['media'][0]['type'] = 'video';
-                $result['media'][0]['video_url'] = html_entity_decode($videoMatch[1]);
-            } else {
-                $result['media'][] = [
-                    'index' => 0,
-                    'type' => 'video',
-                    'video_url' => html_entity_decode($videoMatch[1]),
-                    'preview_url' => $result['preview_url'],
-                ];
-            }
-        }
-
-        // Extract username
-        if (preg_match('/"username"\s*:\s*"([^"]+)"/', $html, $userMatch)) {
-            $result['username'] = '@' . $userMatch[1];
-        } elseif (preg_match('/instagram\.com\/([a-zA-Z0-9_.]+)/', $html, $userMatch)) {
-            $result['username'] = '@' . $userMatch[1];
-        }
-
-        // Extract caption
-        if (preg_match('/<div[^>]+class="[^"]*Caption[^"]*"[^>]*>.*?<span[^>]*>(.+?)<\/span>/is', $html, $captionMatch)) {
-            $result['caption'] = strip_tags(html_entity_decode($captionMatch[1]));
-        }
-
-        $result['resolution'] = '1080 × 1080';
-        $result['download_options'] = $this->generateDownloadOptions($result);
-
-        if (!empty($result['media']) || !empty($result['preview_url'])) {
-            return $result;
-        }
-
-        return null;
-    }
-
-    /**
-     * Parse direct API response
-     */
-    protected function parseDirectResponse(array $item): array
-    {
-        $isVideo = isset($item['video_versions']);
-        $isCarousel = isset($item['carousel_media']);
-        
-        $contentType = 'photo';
-        if ($isVideo) {
-            $contentType = ($item['product_type'] ?? '') === 'clips' ? 'reels' : 'video';
-        }
-
-        $result = [
-            'success' => true,
-            'shortcode' => $item['code'] ?? '',
-            'type' => $contentType,
-            'is_video' => $isVideo,
-            'is_carousel' => $isCarousel,
-            'username' => '@' . ($item['user']['username'] ?? 'unknown'),
-            'user_avatar' => $item['user']['profile_pic_url'] ?? $this->getDefaultAvatar(),
-            'post_date' => isset($item['taken_at']) ? date('F j, Y', $item['taken_at']) : date('F j, Y'),
-            'caption' => $item['caption']['text'] ?? '',
-            'likes' => $item['like_count'] ?? 0,
-            'comments' => $item['comment_count'] ?? 0,
-            'media' => [],
-        ];
-
-        if ($isCarousel) {
-            foreach ($item['carousel_media'] as $index => $media) {
-                $result['media'][] = $this->parseDirectMediaItem($media, $index);
-            }
-            $result['carousel_count'] = count($result['media']);
-        } else {
-            $result['media'][] = $this->parseDirectMediaItem($item, 0);
-            $result['carousel_count'] = 0;
-        }
-
-        // Set preview and main info
-        if (!empty($result['media'])) {
-            $mainMedia = $result['media'][0];
-            $result['preview_url'] = $mainMedia['preview_url'];
-            $result['duration'] = $mainMedia['duration'] ?? null;
-            $result['resolution'] = $mainMedia['resolution'] ?? '1080 × 1080';
-        }
-
-        $result['download_options'] = $this->generateDownloadOptions($result);
-
-        return $result;
-    }
-
-    /**
-     * Parse a single media item from direct API
-     */
-    protected function parseDirectMediaItem(array $item, int $index): array
-    {
-        $isVideo = isset($item['video_versions']);
-        
-        $info = [
-            'index' => $index,
-            'type' => $isVideo ? 'video' : 'photo',
-        ];
-
-        // Get best image
+        // Get preview image - try multiple sources
         $images = $item['image_versions2']['candidates'] ?? [];
-        if (!empty($images)) {
+        if (! empty($images)) {
             usort($images, fn($a, $b) => ($b['width'] ?? 0) - ($a['width'] ?? 0));
-            $info['preview_url'] = $images[0]['url'];
-            $info['width'] = $images[0]['width'] ?? 1080;
-            $info['height'] = $images[0]['height'] ?? 1080;
-            $info['resolution'] = $info['width'] . ' × ' . $info['height'];
-            $info['resources'] = array_map(fn($img) => [
-                'src' => $img['url'],
-                'width' => $img['width'] ?? 0,
+            $media['preview_url'] = $images[0]['url'] ?? '';
+            $media['width']       = $images[0]['width'] ?? 1080;
+            $media['height']      = $images[0]['height'] ?? 1080;
+            $media['resolution']  = $media['width'] . ' × ' . $media['height'];
+
+            $media['resources'] = array_map(fn($img) => [
+                'src'    => $img['url'] ?? '',
+                'width'  => $img['width'] ?? 0,
                 'height' => $img['height'] ?? 0,
             ], $images);
         }
 
-        // Get video URL
-        if ($isVideo) {
-            $videos = $item['video_versions'] ?? [];
-            if (!empty($videos)) {
-                usort($videos, fn($a, $b) => ($b['width'] ?? 0) - ($a['width'] ?? 0));
-                $info['video_url'] = $videos[0]['url'];
-                $info['video_versions'] = $videos;
-            }
-            $info['duration'] = isset($item['video_duration']) 
-                ? $this->formatDuration($item['video_duration']) 
-                : null;
+        // Get video URL - THIS IS CRITICAL
+        if ($isVideo && isset($item['video_versions']) && ! empty($item['video_versions'])) {
+            $videos = $item['video_versions'];
+
+            // Sort by quality (width) - highest first
+            usort($videos, fn($a, $b) => ($b['width'] ?? 0) - ($a['width'] ?? 0));
+
+            // Get the best quality video URL
+            $media['video_url']    = $videos[0]['url'] ?? null;
+            $media['video_width']  = $videos[0]['width'] ?? 0;
+            $media['video_height'] = $videos[0]['height'] ?? 0;
+
+            // Store all versions for quality selection
+            $media['video_versions'] = array_map(fn($v) => [
+                'url'    => $v['url'] ?? '',
+                'width'  => $v['width'] ?? 0,
+                'height' => $v['height'] ?? 0,
+                'type'   => $v['type'] ?? 0,
+            ], $videos);
+
+            Log::info('Extracted video URL', [
+                'url_length'     => strlen($media['video_url'] ?? ''),
+                'versions_count' => count($videos),
+            ]);
         }
 
-        return $info;
+        // Get duration for videos
+        if (isset($item['video_duration'])) {
+            $media['duration']         = $this->formatDuration($item['video_duration']);
+            $media['duration_seconds'] = $item['video_duration'];
+        }
+
+        if (isset($item['view_count'])) {
+            $media['view_count'] = $item['view_count'];
+        } elseif (isset($item['play_count'])) {
+            $media['view_count'] = $item['play_count'];
+        }
+
+        return $media;
     }
 
     /**
-     * Parse regular web page
+     * Fetch via embed page - good for getting video URLs
      */
-    protected function parseWebPage(string $html, string $shortcode): ?array
+    protected function fetchViaEmbed(string $shortcode): ?array
     {
-        // Look for various JSON patterns in the page
-        $patterns = [
-            '/window\._sharedData\s*=\s*(\{.+?\});<\/script>/s',
-            '/window\.__additionalDataLoaded\([^,]+,\s*(\{.+?\})\);/s',
-            '/"graphql"\s*:\s*\{"shortcode_media"\s*:\s*(\{.+?\})\}/s',
+        $embedUrl = "https://www.instagram.com/p/{$shortcode}/embed/";
+
+        $html = $this->makeRequest($embedUrl);
+        if (! $html) {
+            return null;
+        }
+
+        $result = [
+            'video_url'   => null,
+            'preview_url' => null,
         ];
 
-        foreach ($patterns as $pattern) {
+        // Extract video URL from embed page - multiple patterns
+        $videoPatterns = [
+            '/"video_url"\s*:\s*"([^"]+)"/',
+            '/video_url["\']?\s*:\s*["\']([^"\']+)["\']/',
+            '/class="[^"]*EmbeddedMediaVideo[^"]*"[^>]*src="([^"]+)"/',
+            '/<video[^>]+src="([^"]+)"/',
+            '/property="og:video"[^>]+content="([^"]+)"/',
+            '/property="og:video:url"[^>]+content="([^"]+)"/',
+            '/property="og:video:secure_url"[^>]+content="([^"]+)"/',
+        ];
+
+        foreach ($videoPatterns as $pattern) {
             if (preg_match($pattern, $html, $matches)) {
-                $json = json_decode($matches[1], true);
-                if ($json) {
-                    // Try different paths to find media data
-                    $media = $json['entry_data']['PostPage'][0]['graphql']['shortcode_media'] 
-                        ?? $json['graphql']['shortcode_media']
-                        ?? $json['shortcode_media']
-                        ?? null;
-                    
-                    if ($media) {
-                        return $this->parseGraphQLResponse($media);
-                    }
+                $videoUrl = $this->unescapeUrl($matches[1]);
+                if ($this->isValidVideoUrl($videoUrl)) {
+                    $result['video_url'] = $videoUrl;
+                    Log::info('Found video URL via embed pattern', ['pattern' => $pattern]);
+                    break;
                 }
             }
         }
 
-        // Try to find og:image as fallback
-        if (preg_match('/property="og:image"\s+content="([^"]+)"/i', $html, $ogMatch)) {
-            return [
-                'success' => true,
-                'shortcode' => $shortcode,
-                'type' => 'post',
-                'is_video' => strpos($html, 'og:video') !== false,
-                'is_carousel' => false,
-                'username' => '@unknown',
-                'user_avatar' => $this->getDefaultAvatar(),
-                'post_date' => date('F j, Y'),
-                'caption' => '',
-                'preview_url' => html_entity_decode($ogMatch[1]),
-                'media' => [
-                    [
-                        'index' => 0,
-                        'type' => strpos($html, 'og:video') !== false ? 'video' : 'photo',
-                        'preview_url' => html_entity_decode($ogMatch[1]),
-                        'resolution' => '1080 × 1080',
-                    ]
-                ],
-                'resolution' => '1080 × 1080',
-                'download_options' => $this->generateDownloadOptions(['type' => 'photo']),
-            ];
+        // Extract preview image
+        if (preg_match('/class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"/', $html, $m)) {
+            $result['preview_url'] = html_entity_decode($m[1]);
+        } elseif (preg_match('/property="og:image"[^>]+content="([^"]+)"/', $html, $m)) {
+            $result['preview_url'] = html_entity_decode($m[1]);
         }
 
-        return null;
-    }
-
-    /**
-     * Generate download options based on content type
-     */
-    protected function generateDownloadOptions(array $data): array
-    {
-        $isVideo = $data['is_video'] ?? false;
-        $type = $data['type'] ?? 'photo';
-
-        if ($isVideo || $type === 'video' || $type === 'reels') {
-            return [
-                [
-                    'quality' => 'hd',
-                    'label' => 'HD Quality',
-                    'resolution' => '1080p',
-                    'format' => 'mp4',
-                    'estimated_size' => $type === 'reels' ? '~12 MB' : '~15 MB',
-                ],
-                [
-                    'quality' => 'sd',
-                    'label' => 'SD Quality',
-                    'resolution' => '720p',
-                    'format' => 'mp4',
-                    'estimated_size' => $type === 'reels' ? '~6 MB' : '~8 MB',
-                ],
-                [
-                    'quality' => 'audio',
-                    'label' => 'Audio Only',
-                    'resolution' => '320kbps',
-                    'format' => 'mp3',
-                    'estimated_size' => '~3 MB',
-                ],
-            ];
-        }
-
-        return [
-            [
-                'format' => 'jpg',
-                'label' => 'JPG Format',
-                'description' => 'Original Quality • Compressed',
-                'estimated_size' => '~500 KB',
-            ],
-            [
-                'format' => 'png',
-                'label' => 'PNG Format',
-                'description' => 'Lossless • Best Quality',
-                'estimated_size' => '~1.2 MB',
-            ],
-            [
-                'format' => 'webp',
-                'label' => 'WebP Format',
-                'description' => 'Modern • Optimized',
-                'estimated_size' => '~300 KB',
-            ],
-        ];
-    }
-
-    /**
-     * Extract shortcode from Instagram URL
-     */
-    public function extractShortcode(string $url): string
-    {
-        // Match various Instagram URL formats
-        $patterns = [
-            '/instagram\.com\/p\/([A-Za-z0-9_-]+)/i',
-            '/instagram\.com\/reel\/([A-Za-z0-9_-]+)/i',
-            '/instagram\.com\/reels\/([A-Za-z0-9_-]+)/i',
-            '/instagram\.com\/tv\/([A-Za-z0-9_-]+)/i',
-        ];
-
-        foreach ($patterns as $pattern) {
-            if (preg_match($pattern, $url, $matches)) {
-                return $matches[1];
+        // Try to find JSON data in the page
+        if (preg_match('/window\.__additionalDataLoaded\s*\([\'"][^\'"]+[\'"]\s*,\s*(\{.+?\})\s*\)\s*;/s', $html, $jsonMatch)) {
+            $json = json_decode($jsonMatch[1], true);
+            if ($json && isset($json['shortcode_media'])) {
+                $media = $json['shortcode_media'];
+                if (isset($media['video_url']) && $this->isValidVideoUrl($media['video_url'])) {
+                    $result['video_url'] = $media['video_url'];
+                }
             }
         }
 
-        return '';
+        return $result;
     }
 
     /**
-     * Detect content type from URL
+     * Fetch via page scraping
      */
-    public function detectContentType(string $url): string
+    protected function fetchViaPageScrape(string $url, string $shortcode): ?array
     {
-        if (preg_match('/instagram\.com\/(reel|reels)\//i', $url)) {
-            return 'reels';
+        $html = $this->makeRequest($url);
+        if (! $html) {
+            return null;
         }
-        if (preg_match('/instagram\.com\/tv\//i', $url)) {
-            return 'video';
+
+        $result = [
+            'video_url' => null,
+        ];
+
+        // Look for video URL in page source
+        $patterns = [
+            '/"video_url"\s*:\s*"([^"]+)"/',
+            '/contentUrl["\']?\s*:\s*["\']([^"\']+\.mp4[^"\']*)["\']/',
+            '/"playback_video_url"\s*:\s*"([^"]+)"/',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $html, $matches)) {
+                $videoUrl = $this->unescapeUrl($matches[1]);
+                if ($this->isValidVideoUrl($videoUrl)) {
+                    $result['video_url'] = $videoUrl;
+                    Log::info('Found video URL via page scrape', ['pattern' => $pattern]);
+                    break;
+                }
+            }
         }
-        if (preg_match('/instagram\.com\/stories\//i', $url)) {
-            return 'story';
-        }
-        return 'post';
+
+        return $result;
     }
 
     /**
-     * Check if media is a Reels
+     * Parse GraphQL format response
      */
-    protected function isReels(array $media): bool
+    protected function parseGraphQLFormat(array $media): array
     {
-        $productType = $media['product_type'] ?? '';
-        return $productType === 'clips' || $productType === 'reels';
-    }
+        $isVideo    = $media['is_video'] ?? false;
+        $typename   = $media['__typename'] ?? '';
+        $isCarousel = $typename === 'GraphSidecar';
 
-    /**
-     * Extract caption from media
-     */
-    protected function extractCaption(array $media): string
-    {
+        $contentType = 'photo';
+        if ($isVideo) {
+            $productType = $media['product_type'] ?? '';
+            $contentType = ($productType === 'clips' || $productType === 'reels') ? 'reels' : 'video';
+        }
+
+        $owner      = $media['owner'] ?? [];
+        $username   = $owner['username'] ?? 'unknown';
+        $userAvatar = $owner['profile_pic_url'] ?? $this->getDefaultAvatar($username);
+
+        $caption = '';
         if (isset($media['edge_media_to_caption']['edges'][0]['node']['text'])) {
-            return $media['edge_media_to_caption']['edges'][0]['node']['text'];
+            $caption = $media['edge_media_to_caption']['edges'][0]['node']['text'];
         }
-        return $media['caption'] ?? '';
+
+        $timestamp = $media['taken_at_timestamp'] ?? time();
+        $shortcode = $media['shortcode'] ?? '';
+
+        $mediaList = [];
+
+        if ($isCarousel && isset($media['edge_sidecar_to_children']['edges'])) {
+            foreach ($media['edge_sidecar_to_children']['edges'] as $index => $edge) {
+                $mediaList[] = $this->extractGraphQLMedia($edge['node'], $index);
+            }
+        } else {
+            $mediaList[] = $this->extractGraphQLMedia($media, 0);
+        }
+
+        $result = [
+            'success'        => true,
+            'shortcode'      => $shortcode,
+            'type'           => $contentType,
+            'is_video'       => $isVideo,
+            'is_carousel'    => $isCarousel,
+            'carousel_count' => $isCarousel ? count($mediaList) : 0,
+            'username'       => '@' . $username,
+            'user_full_name' => $owner['full_name'] ?? $username,
+            'user_avatar'    => $userAvatar,
+            'post_date'      => date('F j, Y', $timestamp),
+            'timestamp'      => $timestamp,
+            'caption'        => $caption,
+            'likes'          => $media['edge_media_preview_like']['count'] ?? 0,
+            'comments'       => $media['edge_media_to_comment']['count'] ?? 0,
+            'post_url'       => "https://www.instagram.com/p/{$shortcode}/",
+            'media'       => $mediaList,
+            'preview_url' => $media['display_url'] ?? '',
+            'duration'    => $mediaList[0]['duration'] ?? null,
+            'resolution'  => $mediaList[0]['resolution'] ?? '1080 × 1080',
+        ];
+
+        $result['download_options'] = $this->generateDownloadOptions($result);
+
+        return $result;
     }
 
     /**
-     * Format duration in seconds to MM:SS
+     * Extract media from GraphQL node
      */
-    protected function formatDuration(float $seconds): string
+    protected function extractGraphQLMedia(array $node, int $index): array
     {
-        $minutes = floor($seconds / 60);
-        $secs = round($seconds % 60);
-        return sprintf('%d:%02d', $minutes, $secs);
+        $isVideo = $node['is_video'] ?? false;
+
+        $width  = $node['dimensions']['width'] ?? 1080;
+        $height = $node['dimensions']['height'] ?? 1080;
+
+        $media = [
+            'index'       => $index,
+            'type'        => $isVideo ? 'video' : 'photo',
+            'preview_url' => $node['display_url'] ?? '',
+            'video_url'   => null,
+            'width'       => $width,
+            'height'      => $height,
+            'resolution'  => "{$width} × {$height}",
+            'resources' => [],
+        ];
+
+        // Get video URL directly from GraphQL response
+        if ($isVideo && isset($node['video_url'])) {
+            $media['video_url']  = $node['video_url'];
+            $media['view_count'] = $node['video_view_count'] ?? 0;
+
+            if (isset($node['video_duration'])) {
+                $media['duration']         = $this->formatDuration($node['video_duration']);
+                $media['duration_seconds'] = $node['video_duration'];
+            }
+        }
+
+        // Get display resources
+        if (isset($node['display_resources'])) {
+            $media['resources'] = array_map(fn($r) => [
+                'src'    => $r['src'],
+                'width'  => $r['config_width'],
+                'height' => $r['config_height'],
+            ], $node['display_resources']);
+        }
+
+        return $media;
     }
 
     /**
-     * Get image MIME type
+     * Make HTTP request with proper headers
      */
-    protected function getImageMimeType(string $format): string
+    protected function makeRequest(string $url, array $extraHeaders = []): ?string
     {
-        return match (strtolower($format)) {
-            'png' => 'image/png',
-            'webp' => 'image/webp',
-            'gif' => 'image/gif',
-            default => 'image/jpeg',
-        };
+        $headers = array_merge([
+            'User-Agent'      => $this->userAgent,
+            'Accept'          => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/json',
+            'Accept-Language' => 'en-US,en;q=0.9',
+            'Accept-Encoding' => 'gzip, deflate',
+            'Connection'      => 'keep-alive',
+            'Sec-Fetch-Dest'  => 'document',
+            'Sec-Fetch-Mode'  => 'navigate',
+            'Sec-Fetch-Site'  => 'none',
+            'Sec-Fetch-User'  => '?1',
+            'Cache-Control'   => 'max-age=0',
+            'Referer'         => 'https://www.instagram.com/',
+        ], $extraHeaders);
+
+        try {
+            $response = Http::withHeaders($headers)
+                ->withOptions([
+                    'verify'          => false,
+                    'timeout'         => 30,
+                    'connect_timeout' => 10,
+                ])
+                ->get($url);
+
+            if ($response->successful()) {
+                return $response->body();
+            }
+
+            Log::debug('Request failed', ['url' => $url, 'status' => $response->status()]);
+            return null;
+        } catch (Exception $e) {
+            Log::debug('Request exception', ['url' => $url, 'error' => $e->getMessage()]);
+            return null;
+        }
     }
 
     /**
-     * Get default avatar URL
+     * Check if URL is a valid video URL
      */
-    protected function getDefaultAvatar(): string
+    protected function isValidVideoUrl(?string $url): bool
     {
-        return 'https://ui-avatars.com/api/?name=IG&background=E1306C&color=fff&size=150';
+        if (empty($url)) {
+            return false;
+        }
+
+        // Must contain video indicators
+        $videoIndicators = ['.mp4', 'video', '/v/', 'cdninstagram.com'];
+        foreach ($videoIndicators as $indicator) {
+            if (stripos($url, $indicator) !== false) {
+                // Must NOT be an image
+                if (stripos($url, '.jpg') === false && stripos($url, '.png') === false && stripos($url, '.webp') === false) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Clean Instagram URL
+     */
+    protected function cleanInstagramUrl(string $url): string
+    {
+        // Remove query parameters
+        $url = preg_replace('/\?.*$/', '', $url);
+
+        // Normalize reels URLs
+        $url = preg_replace('/instagram\.com\/reels?\//i', 'instagram.com/reel/', $url);
+
+        // Ensure proper format
+        if (! preg_match('/^https?:\/\//', $url)) {
+            $url = 'https://' . $url;
+        }
+
+        return rtrim($url, '/') . '/';
+    }
+
+    /**
+     * Extract shortcode from URL
+     */
+    public function extractShortcode(string $url): string
+    {
+        if (preg_match('/instagram\.com\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i', $url, $matches)) {
+            return $matches[1];
+        }
+        return '';
     }
 
     /**
@@ -793,8 +589,119 @@ class InstagramScraperService
     public function isValidUrl(string $url): bool
     {
         return (bool) preg_match(
-            '/^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels|tv)\/[A-Za-z0-9_-]+/',
+            '/^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels|tv)\/[A-Za-z0-9_-]+/i',
             $url
         );
+    }
+
+    /**
+     * Get video URL by quality
+     */
+    public function getVideoUrl(array $media, string $quality = 'hd'): ?string
+    {
+        // First check for video_versions array
+        if (isset($media['video_versions']) && is_array($media['video_versions']) && ! empty($media['video_versions'])) {
+            $versions = $media['video_versions'];
+
+            if ($quality === 'sd') {
+                // Get lowest quality
+                usort($versions, fn($a, $b) => ($a['width'] ?? 0) - ($b['width'] ?? 0));
+            } else {
+                // Get highest quality (HD)
+                usort($versions, fn($a, $b) => ($b['width'] ?? 0) - ($a['width'] ?? 0));
+            }
+
+            return $versions[0]['url'] ?? null;
+        }
+
+        // Fallback to direct video_url
+        return $media['video_url'] ?? null;
+    }
+
+    /**
+     * Format duration
+     */
+    protected function formatDuration(float $seconds): string
+    {
+        $mins = floor($seconds / 60);
+        $secs = round($seconds % 60);
+        return sprintf('%d:%02d', $mins, $secs);
+    }
+
+    /**
+     * Unescape URL
+     */
+    protected function unescapeUrl(string $url): string
+    {
+        $url = stripslashes($url);
+        $url = str_replace(['\u0026', '\\u0026', '\u002F', '\\u002F'], ['&', '&', '/', '/'], $url);
+        $url = html_entity_decode($url);
+        $url = urldecode($url);
+        return $url;
+    }
+
+    /**
+     * Get default avatar
+     */
+    protected function getDefaultAvatar(string $username): string
+    {
+        $name = ltrim($username, '@');
+        return "https://ui-avatars.com/api/?name=" . urlencode($name) . "&background=E1306C&color=fff&size=150&bold=true";
+    }
+
+    /**
+     * Generate download options
+     */
+    protected function generateDownloadOptions(array $data): array
+    {
+        $isVideo = $data['is_video'] ?? false;
+        $type    = $data['type'] ?? 'photo';
+
+        if ($isVideo || $type === 'video' || $type === 'reels') {
+            return [
+                [
+                    'quality'        => 'hd',
+                    'label'          => 'HD Quality',
+                    'resolution'     => '1080p',
+                    'format'         => 'mp4',
+                    'estimated_size' => $type === 'reels' ? '~12 MB' : '~15 MB',
+                ],
+                [
+                    'quality'        => 'sd',
+                    'label'          => 'SD Quality',
+                    'resolution'     => '720p',
+                    'format'         => 'mp4',
+                    'estimated_size' => $type === 'reels' ? '~6 MB' : '~8 MB',
+                ],
+                [
+                    'quality'        => 'audio',
+                    'label'          => 'Audio Only',
+                    'resolution'     => '320kbps',
+                    'format'         => 'mp3',
+                    'estimated_size' => '~3 MB',
+                ],
+            ];
+        }
+
+        return [
+            [
+                'format'         => 'jpg',
+                'label'          => 'JPG Format',
+                'description'    => 'Original Quality',
+                'estimated_size' => '~500 KB',
+            ],
+            [
+                'format'         => 'png',
+                'label'          => 'PNG Format',
+                'description'    => 'Lossless Quality',
+                'estimated_size' => '~1.2 MB',
+            ],
+            [
+                'format'         => 'webp',
+                'label'          => 'WebP Format',
+                'description'    => 'Optimized',
+                'estimated_size' => '~300 KB',
+            ],
+        ];
     }
 }

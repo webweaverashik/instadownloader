@@ -9,6 +9,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Log;
 use Exception;
 
 class InstagramController extends Controller
@@ -25,7 +26,6 @@ class InstagramController extends Controller
      */
     public function analyze(Request $request): JsonResponse
     {
-        // Rate limiting: 30 requests per minute per IP
         $key = 'analyze:' . $request->ip();
         
         if (RateLimiter::tooManyAttempts($key, 30)) {
@@ -38,20 +38,16 @@ class InstagramController extends Controller
         
         RateLimiter::hit($key, 60);
 
-        // Validate request
         $validator = Validator::make($request->all(), [
             'url' => [
                 'required',
                 'url',
                 function ($attribute, $value, $fail) {
                     if (!$this->scraper->isValidUrl($value)) {
-                        $fail('Please provide a valid Instagram post, reel, or IGTV URL.');
+                        $fail('Please provide a valid Instagram post, reel, or video URL.');
                     }
                 },
             ],
-        ], [
-            'url.required' => 'Please provide an Instagram URL.',
-            'url.url' => 'Please provide a valid URL.',
         ]);
 
         if ($validator->fails()) {
@@ -64,13 +60,20 @@ class InstagramController extends Controller
 
         try {
             $url = $request->input('url');
-            
-            // Analyze the URL using our scraper
             $contentData = $this->scraper->analyzeUrl($url);
 
             if (!$contentData || !isset($contentData['success']) || !$contentData['success']) {
                 throw new Exception('Failed to fetch content data');
             }
+
+            // Log for debugging
+            Log::info('Analyze successful', [
+                'shortcode' => $contentData['shortcode'] ?? 'unknown',
+                'type' => $contentData['type'] ?? 'unknown',
+                'has_video' => $contentData['is_video'] ?? false,
+                'media_count' => count($contentData['media'] ?? []),
+                'first_media_has_video_url' => !empty($contentData['media'][0]['video_url'] ?? null),
+            ]);
 
             return response()->json([
                 'success' => true,
@@ -78,10 +81,10 @@ class InstagramController extends Controller
             ]);
 
         } catch (Exception $e) {
+            Log::error('Analyze failed: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage() ?: 'Failed to analyze URL. The post may be private or deleted.',
-                'error' => config('app.debug') ? $e->getMessage() : null
             ], 500);
         }
     }
@@ -91,7 +94,6 @@ class InstagramController extends Controller
      */
     public function getDownloadUrl(Request $request): JsonResponse
     {
-        // Rate limiting
         $key = 'download:' . $request->ip();
         
         if (RateLimiter::tooManyAttempts($key, 20)) {
@@ -124,42 +126,55 @@ class InstagramController extends Controller
             $format = $request->input('format');
             $mediaIndex = $request->input('media_index', 0);
 
-            // Get content data
             $data = $this->scraper->analyzeUrl($url);
 
             if (!$data || empty($data['media'])) {
                 throw new Exception('Could not fetch media from this URL');
             }
 
-            // Get the specific media item
             $media = $data['media'][$mediaIndex] ?? $data['media'][0];
             $isVideo = $media['type'] === 'video';
 
-            // Build download info
+            // Get the download URL
             if ($isVideo) {
-                $downloadUrl = $media['video_url'] ?? null;
+                // Get video URL based on quality
+                $downloadUrl = $this->scraper->getVideoUrl($media, $quality);
+                
+                // Log what we're getting
+                Log::info('Getting video download URL', [
+                    'quality' => $quality,
+                    'has_video_versions' => isset($media['video_versions']),
+                    'direct_video_url' => isset($media['video_url']),
+                    'result_url_length' => strlen($downloadUrl ?? ''),
+                ]);
+                
+                if (!$downloadUrl) {
+                    // Check if we have the video URL in the right place
+                    throw new Exception('Video URL not available. The video may be protected or the post is private.');
+                }
+                
                 $ext = ($format === 'mp3' || $quality === 'audio') ? 'mp3' : 'mp4';
                 $filename = 'instagram_' . ($data['type'] ?? 'video') . '_' . $data['shortcode'] . '.' . $ext;
                 $type = ($format === 'mp3' || $quality === 'audio') ? 'audio' : 'video';
                 $mimeType = $type === 'audio' ? 'audio/mpeg' : 'video/mp4';
             } else {
+                // Get highest quality image
                 $downloadUrl = $media['preview_url'] ?? null;
                 
-                // Get highest quality
                 if (isset($media['resources']) && !empty($media['resources'])) {
                     $resources = $media['resources'];
                     usort($resources, fn($a, $b) => ($b['width'] ?? 0) - ($a['width'] ?? 0));
                     $downloadUrl = $resources[0]['src'] ?? $downloadUrl;
                 }
                 
+                if (!$downloadUrl) {
+                    throw new Exception('Image URL not available.');
+                }
+                
                 $ext = $format ?: 'jpg';
-                $filename = 'instagram_photo_' . $data['shortcode'] . '_' . $mediaIndex . '.' . $ext;
+                $filename = 'instagram_photo_' . $data['shortcode'] . '_' . ($mediaIndex + 1) . '.' . $ext;
                 $type = 'image';
                 $mimeType = $this->getImageMimeType($ext);
-            }
-
-            if (!$downloadUrl) {
-                throw new Exception('Download URL not available');
             }
 
             // Log the download request
@@ -172,18 +187,24 @@ class InstagramController extends Controller
                 'user_agent' => $request->userAgent(),
             ]);
 
+            // Build proxy URL for safe download
+            $proxyUrl = route('download.proxy') . '?' . http_build_query([
+                'media_url' => $downloadUrl,
+                'filename' => $filename,
+                'type' => $type,
+            ]);
+
+            Log::info('Download URL prepared', [
+                'type' => $type,
+                'filename' => $filename,
+                'url_length' => strlen($downloadUrl),
+            ]);
+
             return response()->json([
                 'success' => true,
                 'data' => [
                     'download_url' => $downloadUrl,
-                    'proxy_url' => route('download.proxy') . '?' . http_build_query([
-                        'url' => $url,
-                        'media_url' => $downloadUrl,
-                        'filename' => $filename,
-                        'type' => $type,
-                        'format' => $ext,
-                        'quality' => $quality,
-                    ]),
+                    'proxy_url' => $proxyUrl,
                     'filename' => $filename,
                     'type' => $type,
                     'format' => $ext,
@@ -194,6 +215,7 @@ class InstagramController extends Controller
             ]);
 
         } catch (Exception $e) {
+            Log::error('Download URL failed: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage() ?: 'Failed to get download URL.',
@@ -233,7 +255,7 @@ class InstagramController extends Controller
                 $isVideo = $media['type'] === 'video';
                 
                 if ($isVideo) {
-                    $downloadUrl = $media['video_url'] ?? null;
+                    $downloadUrl = $this->scraper->getVideoUrl($media, 'hd');
                     $filename = 'instagram_video_' . $data['shortcode'] . '_' . ($index + 1) . '.mp4';
                     $type = 'video';
                     $ext = 'mp4';
@@ -255,12 +277,9 @@ class InstagramController extends Controller
                         'type' => $type,
                         'download_url' => $downloadUrl,
                         'proxy_url' => route('download.proxy') . '?' . http_build_query([
-                            'url' => $url,
                             'media_url' => $downloadUrl,
                             'filename' => $filename,
                             'type' => $type,
-                            'format' => $ext,
-                            'quality' => 'hd',
                         ]),
                         'filename' => $filename,
                         'format' => $ext,
@@ -279,6 +298,7 @@ class InstagramController extends Controller
             ]);
 
         } catch (Exception $e) {
+            Log::error('Carousel downloads failed: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage() ?: 'Failed to get carousel downloads.',
@@ -287,7 +307,7 @@ class InstagramController extends Controller
     }
 
     /**
-     * Get download history (by IP for anonymous users)
+     * Get download history
      */
     public function history(Request $request): JsonResponse
     {
